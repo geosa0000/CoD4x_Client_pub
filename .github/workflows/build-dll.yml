@@ -1,0 +1,33 @@
+name: build-dll
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install prerequisites
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y cmake g++-mingw-w64-i686-posix mingw-w64-i686-dev nasm
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=i686-w64-mingw32-gcc \
+            -DCMAKE_CXX_COMPILER=i686-w64-mingw32-g++
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Upload DLL
+        uses: actions/upload-artifact@v4
+        with:
+          name: cod4x_021-dll
+          path: build/bin/cod4x_*.dll
