@@ -618,6 +618,76 @@ void CG_SetClientDataX(int clnum, const char* name, const char* clantag)
 
 }
 
+/*
+ * Demo anonymizer (movie making, offline demo playback only).
+ * cg_demoAnonNames 1: viewed player -> "player", teammates -> "friendly",
+ * enemies -> "enemy". Applied every frame so re-parsed names are overwritten.
+ */
+extern cvar_t *cl_demoplaying;
+static cvar_t *cg_demoAnonNames;
+
+static void CG_DemoAnon_SetName(int i, const char *label)
+{
+	clientInfo_t *ci = &cg.bgs.clientinfo[i];
+
+	if(strcmp(ci->name, label) != 0)
+	{
+		Q_strncpyz(ci->name, label, sizeof(ci->name));
+	}
+	if(strcmp(gameClientDataX[i].name, label) != 0)
+	{
+		Q_strncpyz(gameClientDataX[i].name, label, sizeof(gameClientDataX[i].name));
+	}
+	gameClientDataX[i].clantag[0] = '\0';
+}
+
+void CG_DemoAnon_Apply(void)
+{
+	int i, viewed;
+	team_t viewedTeam;
+
+	if(cg_demoAnonNames == NULL)
+	{
+		cg_demoAnonNames = Cvar_RegisterBool("cg_demoAnonNames", qfalse, 0, "Demo playback: rename viewed player to 'player', teammates to 'friendly', enemies to 'enemy'");
+	}
+	if(!cg_demoAnonNames->boolean || cl_demoplaying == NULL || !cl_demoplaying->boolean)
+	{
+		return;
+	}
+
+	if(cg.snap)
+		viewed = cg.snap->ps.clientNum;
+	else if(cg.nextSnap)
+		viewed = cg.nextSnap->ps.clientNum;
+	else
+		viewed = cg.clientNum;
+
+	if(viewed < 0 || viewed >= 64 || !cg.bgs.clientinfo[viewed].infoValid)
+	{
+		return;
+	}
+	viewedTeam = cg.bgs.clientinfo[viewed].team;
+
+	for(i = 0; i < 64; ++i)
+	{
+		team_t team;
+
+		if(!cg.bgs.clientinfo[i].infoValid)
+			continue;
+
+		team = cg.bgs.clientinfo[i].team;
+		if(team == TEAM_SPECTATOR)
+			continue;
+
+		if(i == viewed)
+			CG_DemoAnon_SetName(i, "player");
+		else if(viewedTeam != TEAM_FREE && team == viewedTeam)
+			CG_DemoAnon_SetName(i, "friendly");
+		else
+			CG_DemoAnon_SetName(i, "enemy");
+	}
+}
+
 int CG_GetClientNum()
 {
 	return cg.clientNum;
@@ -1129,6 +1199,8 @@ void __cdecl CG_GameMessage(int localClientNum, const char *msg)
 
 void CG_DrawActive()
 {
+
+  CG_DemoAnon_Apply();
 
   float FOVSensitivityScale = cg.zoomSensitivity;
 

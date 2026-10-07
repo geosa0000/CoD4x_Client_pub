@@ -1037,6 +1037,7 @@ void CL_InitOnceForAllClients(){
   cl_password = Cvar_RegisterString("password", "", 2, "password");
   cl_nextdemo = Cvar_RegisterString("nextdemo", "", 0, "The next demo to play");
   cl_lastdemo = Cvar_RegisterString("lastdemo", "", CVAR_ROM, "The last demo played");
+  cg_hidePlayer = Cvar_RegisterString("cg_hidePlayer", "", 0, "Name of a player to hide during demo playback (colour codes ignored)");
   Cvar_RegisterBool("hud_enable", 1, 1, "Enable the HUD display");
   Cvar_RegisterBool("cg_blood", 1, 1, "Show blood");
   cl_demoplaying = Cvar_RegisterBool("cl_demoplaying", qfalse, CVAR_ROM, "State of demo playback");
@@ -7359,6 +7360,114 @@ void CL_ConfigstringModified( void ) {
 
 /*
 =====================
+cg_hidePlayer (demo playback only)
+
+Makes the player whose name is in the cg_hidePlayer dvar invisible.
+
+Entity deltas in the snapshot stream are XOR-coded against the previous
+entity state, so the parsed entity ring must never be edited permanently.
+Every edit is therefore remembered and undone right before the next
+snapshot is parsed; the cgame only ever sees the edited copy.
+=====================
+*/
+cvar_t *cg_hidePlayer;
+
+#define HIDEPLAYER_MAX_TRACKED 256
+#define HIDEPLAYER_RING_SIZE ((int)(sizeof(cl.parseEntities) / sizeof(cl.parseEntities[0])))
+
+typedef struct {
+	int absIndex;	// running index into cl.parseEntities (not wrapped)
+	int eType;	// original entity type
+} hiddenEntity_t;
+
+static hiddenEntity_t hiddenEntities[HIDEPLAYER_MAX_TRACKED];
+static int numHiddenEntities;
+
+static void CL_HidePlayer_Reset( void )
+{
+	numHiddenEntities = 0;
+}
+
+static void CL_HidePlayer_Restore( void )
+{
+	int i;
+
+	for ( i = 0; i < numHiddenEntities; i++ )
+	{
+		int abs = hiddenEntities[i].absIndex;
+
+		// slot already recycled by a newer snapshot, or stale from a previous map/demo
+		if ( abs > cl.parseEntitiesNum || cl.parseEntitiesNum - abs >= HIDEPLAYER_RING_SIZE )
+		{
+			continue;
+		}
+		cl.parseEntities[abs & ( HIDEPLAYER_RING_SIZE - 1 )].eType = hiddenEntities[i].eType;
+	}
+	numHiddenEntities = 0;
+}
+
+static qboolean CL_HidePlayer_NameMatches( const char *clientName, const char *wanted )
+{
+	char a[64], b[64];
+
+	Q_strncpyz( a, clientName, sizeof( a ) );
+	Q_strncpyz( b, wanted, sizeof( b ) );
+	Q_CleanStr( a );
+	Q_CleanStr( b );
+
+	return a[0] && Q_stricmp( a, b ) == 0;
+}
+
+static void CL_HidePlayer_Apply( void )
+{
+	int i, j;
+
+	if ( !clc.demoplaying || !cg_hidePlayer || cg_hidePlayer->string[0] == '\0' )
+	{
+		return;
+	}
+
+	if ( !cl.snap.valid )
+	{
+		return;
+	}
+
+	for ( i = 0; i < cl.snap.numClients; i++ )
+	{
+		clientState_t *cs = &cl.parseClients[( cl.snap.parseClientsNum + i ) & ( (int)( sizeof( cl.parseClients ) / sizeof( cl.parseClients[0] ) ) - 1 )];
+
+		if ( !CL_HidePlayer_NameMatches( cs->name, cg_hidePlayer->string ) )
+		{
+			continue;
+		}
+
+		for ( j = 0; j < cl.snap.numEntities; j++ )
+		{
+			int abs = cl.snap.parseEntitiesNum + j;
+			entityState_t *es = &cl.parseEntities[abs & ( HIDEPLAYER_RING_SIZE - 1 )];
+
+			if ( !( ( es->eType == ET_PLAYER && es->number == cs->clientIndex ) ||
+				( es->eType == ET_PLAYER_CORPSE && es->clientNum == cs->clientIndex ) ) )
+			{
+				continue;
+			}
+
+			if ( numHiddenEntities >= HIDEPLAYER_MAX_TRACKED )
+			{
+				return;
+			}
+
+			hiddenEntities[numHiddenEntities].absIndex = abs;
+			hiddenEntities[numHiddenEntities].eType = es->eType;
+			numHiddenEntities++;
+
+			es->eType = ET_INVISIBLE;
+		}
+	}
+}
+
+/*
+=====================
 CL_ParseServerMessage
 =====================
 */
@@ -7440,7 +7549,9 @@ void CL_ParseServerMessage( msg_t *compressmsg ) {
 				break;
 
 			case svc_snapshot:
+				CL_HidePlayer_Restore();
 				CL_ParseSnapshot( msg );
+				CL_HidePlayer_Apply();
 				break;
 
 			case svc_download:
@@ -7546,6 +7657,7 @@ void CL_PlayDemo( const char* arg, qboolean timedemo, qboolean longpath ) {
     }
 
 	CL_Disconnect( );
+	CL_HidePlayer_Reset();
 
 	// *(int*)0xCB199A8 = 1;
 	//Looking in .iwd files for it
