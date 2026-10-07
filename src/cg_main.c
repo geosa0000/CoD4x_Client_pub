@@ -626,9 +626,16 @@ void CG_SetClientDataX(int clnum, const char* name, const char* clantag)
 extern cvar_t *cl_demoplaying;
 static cvar_t *cg_demoAnonNames;
 
+static char cg_demoRealNames[64][16];	// names as sent by the server, kept while anonymized
+
 static void CG_DemoAnon_SetName(int i, const char *label)
 {
 	clientInfo_t *ci = &cg.bgs.clientinfo[i];
+
+	if(ci->name[0] && strcmp(ci->name, "player") != 0 && strcmp(ci->name, "friendly") != 0 && strcmp(ci->name, "enemy") != 0)
+	{
+		Q_strncpyz(cg_demoRealNames[i], ci->name, sizeof(cg_demoRealNames[i]));
+	}
 
 	if(strcmp(ci->name, label) != 0)
 	{
@@ -639,6 +646,28 @@ static void CG_DemoAnon_SetName(int i, const char *label)
 		Q_strncpyz(gameClientDataX[i].name, label, sizeof(gameClientDataX[i].name));
 	}
 	gameClientDataX[i].clantag[0] = '\0';
+}
+
+/*
+ * Real name of a player in the demo (ignores cg_demoAnonNames), or NULL if
+ * that client slot is not in use. Used by cg_listPlayers / cg_hidePlayer.
+ */
+const char *CG_Demo_GetPlayerName(int clientNum)
+{
+	const char *n;
+
+	if(clientNum < 0 || clientNum >= 64 || !cg.bgs.clientinfo[clientNum].infoValid)
+	{
+		return NULL;
+	}
+	n = cg.bgs.clientinfo[clientNum].name;
+
+	if(cg_demoAnonNames && cg_demoAnonNames->boolean && cg_demoRealNames[clientNum][0] &&
+		(strcmp(n, "player") == 0 || strcmp(n, "friendly") == 0 || strcmp(n, "enemy") == 0))
+	{
+		return cg_demoRealNames[clientNum];
+	}
+	return n[0] ? n : NULL;
 }
 
 void CG_DemoAnon_Apply(void)

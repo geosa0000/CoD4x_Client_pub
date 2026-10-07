@@ -102,6 +102,7 @@ cvar_t *cl_lastdemo;
 cvar_t *cg_hidePlayer;
 cvar_t *cg_hidePlayerMode;
 static void CL_HidePlayer_List_f( void );
+extern const char *CG_Demo_GetPlayerName( int clientNum );
 //Server cvar
 cvar_t *g_gametype;
 cvar_t *cl_replacementDlList;
@@ -7382,7 +7383,6 @@ snapshot is parsed; the cgame only ever sees the edited copy.
 */
 #define HIDEPLAYER_MAX_TRACKED 256
 #define HIDEPLAYER_RING_SIZE ((int)(sizeof(cl.parseEntities) / sizeof(cl.parseEntities[0])))
-#define HIDEPLAYER_CLIENT_RING_SIZE ((int)(sizeof(cl.parseClients) / sizeof(cl.parseClients[0])))
 #define HIDEPLAYER_VOID_Z -30000.0f
 
 typedef struct {
@@ -7448,15 +7448,27 @@ static qboolean CL_HidePlayer_NameMatches( const char *clientName, const char *w
 	return a[0] && strcmp( a, b ) == 0;
 }
 
-static clientState_t *CL_HidePlayer_GetClient( int i )
+// entity type of the entity with this number in the current snapshot, or -1
+static int CL_HidePlayer_EntityType( int number )
 {
-	return &cl.parseClients[( cl.snap.parseClientsNum + i ) & ( HIDEPLAYER_CLIENT_RING_SIZE - 1 )];
+	int j;
+
+	for ( j = 0; j < cl.snap.numEntities; j++ )
+	{
+		entityState_t *es = &cl.parseEntities[( cl.snap.parseEntitiesNum + j ) & ( HIDEPLAYER_RING_SIZE - 1 )];
+
+		if ( es->number == number )
+		{
+			return es->eType;
+		}
+	}
+	return -1;
 }
 
 static void CL_HidePlayer_List_f( void )
 {
 	int i, found = 0;
-	char clean[32];
+	char clean[32] = "name";
 
 	if ( !clc.demoplaying )
 	{
@@ -7464,37 +7476,42 @@ static void CL_HidePlayer_List_f( void )
 		return;
 	}
 
-	if ( !cl.snap.valid )
-	{
-		Com_Printf( CON_CHANNEL_DONT_FILTER, "cg_listPlayers: no snapshot yet, let the demo play for a moment\n" );
-		return;
-	}
-
+	Com_Printf( CON_CHANNEL_DONT_FILTER, "Snapshot: valid=%d, %d entities, %d client states\n", cl.snap.valid, cl.snap.numEntities, cl.snap.numClients );
 	Com_Printf( CON_CHANNEL_DONT_FILTER, "Players in this demo (copy a name exactly into cg_hidePlayer):\n" );
 
-	for ( i = 0; i < cl.snap.numClients; i++ )
+	for ( i = 0; i < 64; i++ )
 	{
-		clientState_t *cs = CL_HidePlayer_GetClient( i );
+		const char *name = CG_Demo_GetPlayerName( i );
+		int etype;
 
-		if ( !cs->name[0] )
+		if ( !name )
 		{
 			continue;
 		}
 
-		Q_strncpyz( clean, cs->name, sizeof( clean ) );
+		Q_strncpyz( clean, name, sizeof( clean ) );
 		Q_CleanStr( clean );
+		etype = CL_HidePlayer_EntityType( i );
 
-		Com_Printf( CON_CHANNEL_DONT_FILTER, "  client %2d  \"%s\"%s\n", cs->clientIndex, clean,
-			( cg_hidePlayer && CL_HidePlayer_NameMatches( cs->name, cg_hidePlayer->string ) ) ? "   <- hidden" : "" );
+		if ( etype < 0 )
+		{
+			Com_Printf( CON_CHANNEL_DONT_FILTER, "  client %2d  \"%s\"  (no entity in snapshot)%s\n", i, clean,
+				( cg_hidePlayer && CL_HidePlayer_NameMatches( name, cg_hidePlayer->string ) ) ? "   <- selected" : "" );
+		}
+		else
+		{
+			Com_Printf( CON_CHANNEL_DONT_FILTER, "  client %2d  \"%s\"  (entity type %d)%s\n", i, clean, etype,
+				( cg_hidePlayer && CL_HidePlayer_NameMatches( name, cg_hidePlayer->string ) ) ? "   <- selected" : "" );
+		}
 		found++;
 	}
 
-	Com_Printf( CON_CHANNEL_DONT_FILTER, "%d player(s). Example: cg_hidePlayer \"%s\"\n", found, found ? clean : "name" );
+	Com_Printf( CON_CHANNEL_DONT_FILTER, "%d player(s). Example: cg_hidePlayer %s\n", found, clean );
 }
 
 static void CL_HidePlayer_Apply( void )
 {
-	int i, j, hiddenNow = 0;
+	int c, j, hiddenNow = 0, matchedClient = -1;
 	int mode;
 
 	if ( !clc.demoplaying || !cg_hidePlayer || cg_hidePlayer->string[0] == '\0' )
@@ -7511,22 +7528,23 @@ static void CL_HidePlayer_Apply( void )
 
 	mode = cg_hidePlayerMode ? cg_hidePlayerMode->integer : 0;
 
-	for ( i = 0; i < cl.snap.numClients; i++ )
+	for ( c = 0; c < 64; c++ )
 	{
-		clientState_t *cs = CL_HidePlayer_GetClient( i );
+		const char *name = CG_Demo_GetPlayerName( c );
 
-		if ( !CL_HidePlayer_NameMatches( cs->name, cg_hidePlayer->string ) )
+		if ( !name || !CL_HidePlayer_NameMatches( name, cg_hidePlayer->string ) )
 		{
 			continue;
 		}
+		matchedClient = c;
 
 		for ( j = 0; j < cl.snap.numEntities; j++ )
 		{
 			int abs = cl.snap.parseEntitiesNum + j;
 			entityState_t *es = &cl.parseEntities[abs & ( HIDEPLAYER_RING_SIZE - 1 )];
 
-			if ( !( ( es->eType == ET_PLAYER && es->number == cs->clientIndex ) ||
-				( es->eType == ET_PLAYER_CORPSE && es->clientNum == cs->clientIndex ) ) )
+			if ( !( ( es->eType == ET_PLAYER && es->number == c ) ||
+				( es->eType == ET_PLAYER_CORPSE && es->clientNum == c ) ) )
 			{
 				continue;
 			}
@@ -7553,8 +7571,8 @@ static void CL_HidePlayer_Apply( void )
 		}
 	}
 
-	// tell the user once per value whether the name was found
-	// (state 1 = "not found" printed, state 2 = "hiding" printed)
+	// tell the user once per value what happened
+	// (state 1 = a problem was printed, state 2 = "hiding" was printed)
 	if ( strcmp( hidePlayerReported, cg_hidePlayer->string ) != 0 )
 	{
 		Q_strncpyz( hidePlayerReported, cg_hidePlayer->string, sizeof( hidePlayerReported ) );
@@ -7563,12 +7581,19 @@ static void CL_HidePlayer_Apply( void )
 
 	if ( hiddenNow && hidePlayerState != 2 )
 	{
-		Com_Printf( CON_CHANNEL_DONT_FILTER, "cg_hidePlayer: hiding \"%s\"\n", cg_hidePlayer->string );
+		Com_Printf( CON_CHANNEL_DONT_FILTER, "cg_hidePlayer: hiding \"%s\" (client %d)\n", cg_hidePlayer->string, matchedClient );
 		hidePlayerState = 2;
 	}
 	else if ( !hiddenNow && hidePlayerState == 0 )
 	{
-		Com_Printf( CON_CHANNEL_DONT_FILTER, "cg_hidePlayer: no player named \"%s\" found right now, use cg_listPlayers to see the exact names\n", cg_hidePlayer->string );
+		if ( matchedClient >= 0 )
+		{
+			Com_Printf( CON_CHANNEL_DONT_FILTER, "cg_hidePlayer: found \"%s\" (client %d) but there is no player entity for him in the current snapshot (%d entities)\n", cg_hidePlayer->string, matchedClient, cl.snap.numEntities );
+		}
+		else
+		{
+			Com_Printf( CON_CHANNEL_DONT_FILTER, "cg_hidePlayer: no player named \"%s\" found right now, use cg_listPlayers to see the exact names\n", cg_hidePlayer->string );
+		}
 		hidePlayerState = 1;
 	}
 }
