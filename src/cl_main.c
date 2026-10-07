@@ -100,6 +100,8 @@ cvar_t *cl_vehDriverViewHeightMax;
 cvar_t *cl_demoplaying;
 cvar_t *cl_lastdemo;
 cvar_t *cg_hidePlayer;
+cvar_t *cg_hidePlayerMode;
+static void CL_HidePlayer_List_f( void );
 //Server cvar
 cvar_t *g_gametype;
 cvar_t *cl_replacementDlList;
@@ -1038,7 +1040,8 @@ void CL_InitOnceForAllClients(){
   cl_password = Cvar_RegisterString("password", "", 2, "password");
   cl_nextdemo = Cvar_RegisterString("nextdemo", "", 0, "The next demo to play");
   cl_lastdemo = Cvar_RegisterString("lastdemo", "", CVAR_ROM, "The last demo played");
-  cg_hidePlayer = Cvar_RegisterString("cg_hidePlayer", "", 0, "Name of a player to hide during demo playback (colour codes ignored)");
+  cg_hidePlayer = Cvar_RegisterString("cg_hidePlayer", "", 0, "Exact name of a player to hide during demo playback (see cg_listPlayers)");
+  cg_hidePlayerMode = Cvar_RegisterInt("cg_hidePlayerMode", 0, 0, 2, 0, "How cg_hidePlayer hides: 0 = invisible and moved away, 1 = invisible only, 2 = moved away only");
   Cvar_RegisterBool("hud_enable", 1, 1, "Enable the HUD display");
   Cvar_RegisterBool("cg_blood", 1, 1, "Show blood");
   cl_demoplaying = Cvar_RegisterBool("cl_demoplaying", qfalse, CVAR_ROM, "State of demo playback");
@@ -1056,6 +1059,7 @@ void CL_InitOnceForAllClients(){
   Cmd_AddCommand("cmd", CL_ForwardToServer_f);
   Cmd_AddCommand("configstrings", CL_Configstrings_f);
   Cmd_AddCommand("clientinfo", CL_Clientinfo_f);
+  Cmd_AddCommand("cg_listPlayers", CL_HidePlayer_List_f);
   Cmd_AddCommand("vid_restart", CL_Vid_Restart_WithClNvidiaCleanup_f);
   Cmd_AddCommand("snd_restart", CL_Snd_Restart_f);
   Cmd_AddCommand("disconnect", CL_Disconnect_f);
@@ -7363,7 +7367,12 @@ void CL_ConfigstringModified( void ) {
 =====================
 cg_hidePlayer (demo playback only)
 
-Makes the player whose name is in the cg_hidePlayer dvar invisible.
+  cg_listPlayers          prints every player in the demo (exact names)
+  cg_hidePlayer "<name>"  hides that player (exact name; colour codes in the
+                          name may be left out)
+  cg_hidePlayerMode <n>   0 = invisible + moved out of the map (default)
+                          1 = invisible only
+                          2 = moved out of the map only
 
 Entity deltas in the snapshot stream are XOR-coded against the previous
 entity state, so the parsed entity ring must never be edited permanently.
@@ -7371,21 +7380,27 @@ Every edit is therefore remembered and undone right before the next
 snapshot is parsed; the cgame only ever sees the edited copy.
 =====================
 */
-
 #define HIDEPLAYER_MAX_TRACKED 256
 #define HIDEPLAYER_RING_SIZE ((int)(sizeof(cl.parseEntities) / sizeof(cl.parseEntities[0])))
+#define HIDEPLAYER_CLIENT_RING_SIZE ((int)(sizeof(cl.parseClients) / sizeof(cl.parseClients[0])))
+#define HIDEPLAYER_VOID_Z -30000.0f
 
 typedef struct {
 	int absIndex;	// running index into cl.parseEntities (not wrapped)
 	int eType;	// original entity type
+	float posZ;	// original height
 } hiddenEntity_t;
 
 static hiddenEntity_t hiddenEntities[HIDEPLAYER_MAX_TRACKED];
 static int numHiddenEntities;
+static char hidePlayerReported[64];	// last cg_hidePlayer value we told the user about
+static int hidePlayerState;
 
 static void CL_HidePlayer_Reset( void )
 {
 	numHiddenEntities = 0;
+	hidePlayerReported[0] = '\0';
+	hidePlayerState = 0;
 }
 
 static void CL_HidePlayer_Restore( void )
@@ -7395,35 +7410,97 @@ static void CL_HidePlayer_Restore( void )
 	for ( i = 0; i < numHiddenEntities; i++ )
 	{
 		int abs = hiddenEntities[i].absIndex;
+		entityState_t *es;
 
 		// slot already recycled by a newer snapshot, or stale from a previous map/demo
 		if ( abs > cl.parseEntitiesNum || cl.parseEntitiesNum - abs >= HIDEPLAYER_RING_SIZE )
 		{
 			continue;
 		}
-		cl.parseEntities[abs & ( HIDEPLAYER_RING_SIZE - 1 )].eType = hiddenEntities[i].eType;
+		es = &cl.parseEntities[abs & ( HIDEPLAYER_RING_SIZE - 1 )];
+		es->eType = hiddenEntities[i].eType;
+		es->lerp.pos.trBase[2] = hiddenEntities[i].posZ;
 	}
 	numHiddenEntities = 0;
 }
 
+// exact comparison against the name as sent by the server, or against
+// the same name with its colour codes removed
 static qboolean CL_HidePlayer_NameMatches( const char *clientName, const char *wanted )
 {
-	char a[64], b[64];
+	char a[32], b[64];
+
+	if ( !clientName[0] || !wanted[0] )
+	{
+		return qfalse;
+	}
+
+	if ( strcmp( clientName, wanted ) == 0 )
+	{
+		return qtrue;
+	}
 
 	Q_strncpyz( a, clientName, sizeof( a ) );
 	Q_strncpyz( b, wanted, sizeof( b ) );
 	Q_CleanStr( a );
 	Q_CleanStr( b );
 
-	return a[0] && Q_stricmp( a, b ) == 0;
+	return a[0] && strcmp( a, b ) == 0;
+}
+
+static clientState_t *CL_HidePlayer_GetClient( int i )
+{
+	return &cl.parseClients[( cl.snap.parseClientsNum + i ) & ( HIDEPLAYER_CLIENT_RING_SIZE - 1 )];
+}
+
+static void CL_HidePlayer_List_f( void )
+{
+	int i, found = 0;
+	char clean[32];
+
+	if ( !clc.demoplaying )
+	{
+		Com_Printf( CON_CHANNEL_DONT_FILTER, "cg_listPlayers: only available while a demo is playing\n" );
+		return;
+	}
+
+	if ( !cl.snap.valid )
+	{
+		Com_Printf( CON_CHANNEL_DONT_FILTER, "cg_listPlayers: no snapshot yet, let the demo play for a moment\n" );
+		return;
+	}
+
+	Com_Printf( CON_CHANNEL_DONT_FILTER, "Players in this demo (copy a name exactly into cg_hidePlayer):\n" );
+
+	for ( i = 0; i < cl.snap.numClients; i++ )
+	{
+		clientState_t *cs = CL_HidePlayer_GetClient( i );
+
+		if ( !cs->name[0] )
+		{
+			continue;
+		}
+
+		Q_strncpyz( clean, cs->name, sizeof( clean ) );
+		Q_CleanStr( clean );
+
+		Com_Printf( CON_CHANNEL_DONT_FILTER, "  client %2d  \"%s\"%s\n", cs->clientIndex, clean,
+			( cg_hidePlayer && CL_HidePlayer_NameMatches( cs->name, cg_hidePlayer->string ) ) ? "   <- hidden" : "" );
+		found++;
+	}
+
+	Com_Printf( CON_CHANNEL_DONT_FILTER, "%d player(s). Example: cg_hidePlayer \"%s\"\n", found, found ? clean : "name" );
 }
 
 static void CL_HidePlayer_Apply( void )
 {
-	int i, j;
+	int i, j, hiddenNow = 0;
+	int mode;
 
 	if ( !clc.demoplaying || !cg_hidePlayer || cg_hidePlayer->string[0] == '\0' )
 	{
+		hidePlayerReported[0] = '\0';
+		hidePlayerState = 0;
 		return;
 	}
 
@@ -7432,9 +7509,11 @@ static void CL_HidePlayer_Apply( void )
 		return;
 	}
 
+	mode = cg_hidePlayerMode ? cg_hidePlayerMode->integer : 0;
+
 	for ( i = 0; i < cl.snap.numClients; i++ )
 	{
-		clientState_t *cs = &cl.parseClients[( cl.snap.parseClientsNum + i ) & ( (int)( sizeof( cl.parseClients ) / sizeof( cl.parseClients[0] ) ) - 1 )];
+		clientState_t *cs = CL_HidePlayer_GetClient( i );
 
 		if ( !CL_HidePlayer_NameMatches( cs->name, cg_hidePlayer->string ) )
 		{
@@ -7459,10 +7538,38 @@ static void CL_HidePlayer_Apply( void )
 
 			hiddenEntities[numHiddenEntities].absIndex = abs;
 			hiddenEntities[numHiddenEntities].eType = es->eType;
+			hiddenEntities[numHiddenEntities].posZ = es->lerp.pos.trBase[2];
 			numHiddenEntities++;
 
-			es->eType = ET_INVISIBLE;
+			if ( mode != 2 )
+			{
+				es->eType = ET_INVISIBLE;
+			}
+			if ( mode != 1 )
+			{
+				es->lerp.pos.trBase[2] = HIDEPLAYER_VOID_Z;
+			}
+			hiddenNow++;
 		}
+	}
+
+	// tell the user once per value whether the name was found
+	// (state 1 = "not found" printed, state 2 = "hiding" printed)
+	if ( strcmp( hidePlayerReported, cg_hidePlayer->string ) != 0 )
+	{
+		Q_strncpyz( hidePlayerReported, cg_hidePlayer->string, sizeof( hidePlayerReported ) );
+		hidePlayerState = 0;
+	}
+
+	if ( hiddenNow && hidePlayerState != 2 )
+	{
+		Com_Printf( CON_CHANNEL_DONT_FILTER, "cg_hidePlayer: hiding \"%s\"\n", cg_hidePlayer->string );
+		hidePlayerState = 2;
+	}
+	else if ( !hiddenNow && hidePlayerState == 0 )
+	{
+		Com_Printf( CON_CHANNEL_DONT_FILTER, "cg_hidePlayer: no player named \"%s\" found right now, use cg_listPlayers to see the exact names\n", cg_hidePlayer->string );
+		hidePlayerState = 1;
 	}
 }
 
