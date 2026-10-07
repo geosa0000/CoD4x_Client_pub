@@ -99,6 +99,7 @@ cvar_t *cl_vehDriverViewHeightMin;
 cvar_t *cl_vehDriverViewHeightMax;
 cvar_t *cl_demoplaying;
 cvar_t *cl_lastdemo;
+cvar_t *cg_hidePlayer;
 //Server cvar
 cvar_t *g_gametype;
 cvar_t *cl_replacementDlList;
@@ -7370,7 +7371,6 @@ Every edit is therefore remembered and undone right before the next
 snapshot is parsed; the cgame only ever sees the edited copy.
 =====================
 */
-cvar_t *cg_hidePlayer;
 
 #define HIDEPLAYER_MAX_TRACKED 256
 #define HIDEPLAYER_RING_SIZE ((int)(sizeof(cl.parseEntities) / sizeof(cl.parseEntities[0])))
